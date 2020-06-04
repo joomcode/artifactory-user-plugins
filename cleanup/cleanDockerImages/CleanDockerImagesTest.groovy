@@ -9,11 +9,11 @@ class CleanDockerImagesTest extends Specification {
         setup:
         def baseurl = 'http://localhost:8088/artifactory'
         def artifactory = ArtifactoryClientBuilder.create().setUrl(baseurl)
-            .setUsername('admin').setPassword('password').build()
+                .setUsername('admin').setPassword('password').build()
 
         def builder = artifactory.repositories().builders()
         def local = builder.localRepositoryBuilder().key('example-docker-local')
-            .repositorySettings(new DockerRepositorySettingsImpl()).build()
+                .repositorySettings(new DockerRepositorySettingsImpl()).build()
         artifactory.repositories().create(0, local)
         def repo = artifactory.repository('example-docker-local')
         mkImage(repo, 'foo1/bar/manifest.json', 'text1', 1)
@@ -91,7 +91,7 @@ class CleanDockerImagesTest extends Specification {
     }
 
     void mkImage(repo, path, content, ct) {
-        def prop = 'docker.label.com.jfrog.artifactory.retention.maxCount'
+        def prop = 'docker.label.com.joom.retention.maxCount'
         def stream = new ByteArrayInputStream(content.getBytes('utf-8'))
         repo.upload(path, stream).doUpload()
         repo.file(path).properties().addProperty(prop, "$ct").doSet()

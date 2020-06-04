@@ -17,8 +17,33 @@
 // Created by Madhu Reddy on 6/16/17.
 
 import groovy.json.JsonBuilder
-import java.util.concurrent.TimeUnit
+import org.artifactory.fs.ItemInfo
+import org.artifactory.fs.StatsInfo
+import org.artifactory.repo.RepoPath
 import org.artifactory.repo.RepoPathFactory
+import org.artifactory.repo.Repositories
+import org.joda.time.DateTime
+
+import java.util.concurrent.TimeUnit
+
+Repositories repositories
+
+class ImageInfo {
+    ItemInfo repo
+
+    // Properties
+    long expireDate // com.joom.retention.expireDate=YYYY-MM-DD
+
+    // Labels
+    Integer pullProtectDays // com.joom.retention.pullProtectDays=N
+    Integer maxDays // com.joom.retention.maxDays=N
+    Integer maxCount // com.joom.retention.maxCount=N
+    String maxCountGroup // com.joom.retention.maxCountGroup
+
+    // Image info
+    long createdTime
+    long pullDate
+}
 
 // usage: curl -X POST http://localhost:8088/artifactory/api/plugins/execute/cleanDockerImages
 
@@ -27,11 +52,13 @@ executions {
         def deleted = []
         def etcdir = ctx.artifactoryHome.etcDir
         def propsfile = new File(etcdir, "plugins/cleanDockerImages.properties")
-        def repos = new ConfigSlurper().parse(propsfile.toURL()).dockerRepos
+        def parsed = new ConfigSlurper().parse(propsfile.toURL())
+        def repos = parsed.dockerRepos
+        def defaultMaxDays = parsed.defaultMaxDays
         def dryRun = params['dryRun'] ? params['dryRun'][0] as boolean : false
         repos.each {
             log.debug("Cleaning Docker images in repo: $it")
-            def del = buildParentRepoPaths(RepoPathFactory.create(it), dryRun)
+            def del = buildParentRepoPaths(RepoPathFactory.create(it), defaultMaxDays, dryRun)
             deleted.addAll(del)
         }
         def json = [status: 'okay', dryRun: dryRun, deleted: deleted]
@@ -40,40 +67,32 @@ executions {
     }
 }
 
-def buildParentRepoPaths(path, dryRun) {
-    def deleted = [], oldSet = [], imagesPathMap = [:], imagesCount = [:]
-    def parentInfo = repositories.getItemInfo(path)
-    simpleTraverse(parentInfo, oldSet, imagesPathMap, imagesCount)
-    for (img in oldSet) {
-        deleted << img.id
-        if (!dryRun) repositories.delete(img)
-    }
-    for (key in imagesPathMap.keySet()) {
-        def repoList = imagesPathMap[key]
-        def maxImagesCount = imagesCount[key]
-        // If number of current docker images is more than maxcount, delete them
-        if (maxImagesCount <= 0 || repoList.size() <= maxImagesCount) continue
-        repoList = repoList.sort { it[1] }
-        def deleteCount = repoList.size() - maxImagesCount
-        for (i = 0; i < deleteCount; i += 1) {
-            deleted << repoList[i][0].id
-            if (!dryRun) repositories.delete(repoList[i][0])
-        }
-    }
-    return deleted
+def buildParentRepoPaths(path, int defaultMaxDays, boolean dryRun) {
+    return registryTraverse(repositories.getItemInfo(path), defaultMaxDays, dryRun)
 }
 
 // Traverse through the docker repo (directories and sub-directories) and:
 // - delete the images immediately if the maxDays policy applies
 // - Aggregate the images that qualify for maxCount policy (to get deleted in
 //   the execution closure)
-def simpleTraverse(parentInfo, oldSet, imagesPathMap, imagesCount) {
-    def maxCount = null
-    def parentRepoPath = parentInfo.repoPath
+
+// - if docker image has `com.joom.retention.expireDate` property in the past - remove image;
+// - if docker image has `com.joom.retention.expireDate` property in the future - keep image;
+// - keep recently pulled images with `com.joom.retention.pullProtectDays` label (-1 - infinity time);
+// - remove docker images if `com.joom.retention.maxDays` policy applices (-1 - infinity time);
+// - aggregate the images for `com.joom.retention.maxCount` policy.
+List<String> registryTraverse(ItemInfo parentInfo, int defaultMaxDays, boolean dryRun, Map<String, List<ImageInfo>> parentGroups = null, List<String> deleted = []) {
+    List<RepoPath> removeSet = new ArrayList<>()
+    List<ItemInfo> pendingQueue = new ArrayList<>()
+
+    // Process current image
+    RepoPath parentRepoPath = parentInfo.repoPath
+    long now = new Date().time
+    long oneDay = TimeUnit.MILLISECONDS.convert(1, TimeUnit.DAYS)
     for (childItem in repositories.getChildren(parentRepoPath)) {
         def currentPath = childItem.repoPath
         if (childItem.isFolder()) {
-            simpleTraverse(childItem, oldSet, imagesPathMap, imagesCount)
+            pendingQueue << childItem
             continue
         }
         log.debug("Scanning File: $currentPath.name")
@@ -83,45 +102,119 @@ def simpleTraverse(parentInfo, oldSet, imagesPathMap, imagesCount) {
         //   qualify
         // - aggregate the image info to group by image and sort by create
         //   date for maxCount policy
-        if (checkDaysPassedForDelete(childItem)) {
-            log.debug("Adding to OLD MAP: $parentRepoPath")
-            oldSet << parentRepoPath
-        } else if ((maxCount = getMaxCountForDelete(childItem)) > 0) {
-            log.debug("Adding to IMAGES MAP: $parentRepoPath")
-            def parentCreatedDate = parentInfo.created
-            def parentId = parentRepoPath.parent.id
-            def oldmax = maxCount
-            if (parentId in imagesCount) oldmax = imagesCount[parentId]
-            imagesCount[parentId] = maxCount > oldmax ? maxCount : oldmax
-            if (!imagesPathMap.containsKey(parentId)) {
-                imagesPathMap[parentId] = []
-            }
-            imagesPathMap[parentId] << [parentRepoPath, childItem.created]
+
+        ImageInfo info = getImageInfo(parentInfo, childItem)
+        if (info == null) {
+            log.error("Invalid image labels: $parentRepoPath")
+            continue
         }
-        break
+        if (info.expireDate > 0) {
+            if (info.expireDate >= now) {
+                log.warn("Removing image: $parentRepoPath - by expireDate")
+                removeSet << parentRepoPath
+                continue
+            }
+            log.debug("Keep image: $parentRepoPath - expireDate is in future")
+            continue
+        }
+
+        if ((info.pullProtectDays != null) && (info.pullDate > 0)) {
+            if (info.pullProtectDays < 0) {
+                log.debug("Keep image: $parentRepoPath - pulled and protected by infinity time")
+                continue
+            }
+            if (info.pullDate + info.pullProtectDays * oneDay < now) {
+                log.debug("Keep image: $parentRepoPath - pulled recently")
+                continue
+            }
+        }
+
+        if ((info.maxCount == null) && (info.maxDays == null)) {
+            info.maxDays = defaultMaxDays
+        }
+
+        isDefault = true
+        if (info.maxDays != null) {
+            if (info.maxDays < 0) {
+                log.debug("Keep image: $parentRepoPath - keep forever")
+                continue
+            }
+            if (info.createdTime + info.maxDays * oneDay <= now) {
+                log.warn("Removing image: $parentRepoPath - created too long")
+                removeSet << parentRepoPath
+                continue
+            }
+            isDefault = false
+        }
+
+        if (info.maxCount != null) {
+            if (!parentGroups.containsKey(info.maxCountGroup)) {
+                parentGroups.put(info.maxCountGroup, new ArrayList<>())
+            }
+            parentGroups[info.maxCountGroup] << info
+            continue
+        }
+        log.debug("Keep image: $parentRepoPath - created recently")
     }
+
+    // Process registry and subregistry
+    Map<String, List<ImageInfo>> childGroups = new HashMap<>()
+    for (item in pendingQueue) {
+        registryTraverse(item, defaultMaxDays, dryRun, childGroups, deleted)
+    }
+
+    for (group in childGroups.values()) {
+        group = group.sort { -it.createdTime }
+
+        int keeped = 0
+        for (item in group) {
+            if (keeped < item.maxCount) {
+                log.debug("Keep image: ${item.repo.repoPath} - max count not reached")
+                keeped++
+                continue
+            }
+            log.warn("Removing image: ${item.repo.repoPath} - too many images")
+            removeSet << item.repo.repoPath
+        }
+    }
+
+    // Remove images from repository
+    for (RepoPath item in removeSet) {
+        deleted << item.id
+        if (!dryRun) repositories.delete(item)
+    }
+    return deleted
 }
 
-// This method checks if the docker image's manifest has the property
-// "com.jfrog.artifactory.retention.maxDays" for purge
-def checkDaysPassedForDelete(item) {
-    def maxDaysProp = "docker.label.com.jfrog.artifactory.retention.maxDays"
-    def oneday = TimeUnit.MILLISECONDS.convert(1, TimeUnit.DAYS)
-    def prop = repositories.getProperty(item.repoPath, maxDaysProp)
-    if (!prop) return false
-    log.debug("PROPERTY $maxDaysProp FOUND = $prop IN MANIFEST FILE")
-    prop = prop.isInteger() ? prop.toInteger() : null
-    if (prop == null) return false
-    return ((new Date().time - item.created) / oneday) >= prop
-}
+ImageInfo getImageInfo(ItemInfo repo, ItemInfo item) {
+    try {
+        StatsInfo statsInfo = repositories.getStats(item.repoPath)
+        String expireDateProp = repositories.getProperty(item.repoPath, "com.joom.retention.expireDate")
+        if (expireDateProp == null) {
+            expireDateProp = repositories.getProperty(repo.repoPath, "com.joom.retention.expireDate")
+        }
+        String pullProtectDaysProp = repositories.getProperty(item.repoPath, "docker.label.com.joom.retention.pullProtectDays")
+        String maxDaysProp = repositories.getProperty(item.repoPath, "docker.label.com.joom.retention.maxDays")
+        String maxCountProp = repositories.getProperty(item.repoPath, "docker.label.com.joom.retention.maxCount")
+        String maxCountGroupProp = repositories.getProperty(item.repoPath, "docker.label.com.joom.retention.maxCountGroup")
+        return new ImageInfo(
+                repo: repo,
 
-// This method checks if the docker image's manifest has the property
-// "com.jfrog.artifactory.retention.maxCount" for purge
-def getMaxCountForDelete(item) {
-    def maxCountProp = "docker.label.com.jfrog.artifactory.retention.maxCount"
-    def prop = repositories.getProperty(item.repoPath, maxCountProp)
-    if (!prop) return 0
-    log.debug "PROPERTY $maxCountProp FOUND = $prop IN MANIFEST FILE"
-    prop = prop.isInteger() ? prop.toInteger() : 0
-    return prop > 0 ? prop : 0
+                // Properties
+                expireDate: expireDateProp ? DateTime.parse(expireDateProp).millis : 0L,
+
+                // Labels
+                pullProtectDays: pullProtectDaysProp ? pullProtectDaysProp.toInteger() : null,
+                maxDays: maxDaysProp ? maxDaysProp.toInteger() : null,
+                maxCount: maxCountProp ? maxCountProp.toInteger() : null,
+                maxCountGroup: maxCountGroupProp ? maxCountGroupProp : "",
+
+                // Image info
+                createdTime: item.lastModified,
+                pullDate: statsInfo ? statsInfo.lastDownloaded : 0L,
+        )
+    } catch (IllegalArgumentException e) {
+        log.error(e.printStackTrace())
+        return null
+    }
 }
