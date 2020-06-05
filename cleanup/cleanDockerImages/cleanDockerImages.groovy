@@ -123,7 +123,7 @@ List<String> registryTraverse(ItemInfo parentInfo, int defaultMaxDays, boolean d
                 log.debug("Keep image: $parentRepoPath - pulled and protected by infinity time")
                 continue
             }
-            if (info.pullDate + info.pullProtectDays * oneDay < now) {
+            if (info.pullDate + info.pullProtectDays * oneDay > now) {
                 log.debug("Keep image: $parentRepoPath - pulled recently")
                 continue
             }
