@@ -17,6 +17,7 @@
 // Created by Madhu Reddy on 6/16/17.
 
 import groovy.json.JsonBuilder
+import groovy.json.JsonSlurper
 import org.artifactory.fs.ItemInfo
 import org.artifactory.fs.StatsInfo
 import org.artifactory.repo.RepoPath
@@ -42,7 +43,6 @@ class ImageInfo {
 
     // Image info
     long createdTime
-    long pullDate
 }
 
 // usage: curl -X POST http://localhost:8088/artifactory/api/plugins/execute/cleanDockerImages
@@ -89,43 +89,63 @@ List<String> registryTraverse(ItemInfo parentInfo, int defaultMaxDays, boolean d
     RepoPath parentRepoPath = parentInfo.repoPath
     long now = new Date().time
     long oneDay = TimeUnit.MILLISECONDS.convert(1, TimeUnit.DAYS)
-    for (childItem in repositories.getChildren(parentRepoPath)) {
+
+    Map<String, RepoPath> layerPaths = new HashMap<>()
+    ItemInfo manifestInfo
+    for (ItemInfo childItem in repositories.getChildren(parentRepoPath)) {
         def currentPath = childItem.repoPath
         if (childItem.isFolder()) {
             pendingQueue << childItem
             continue
         }
-        log.debug("Scanning File: $currentPath.name")
-        if (currentPath.name != "manifest.json") continue
-        // get the properties here and delete based on policies:
-        // - implement daysPassed policy first and delete the images that
-        //   qualify
-        // - aggregate the image info to group by image and sort by create
-        //   date for maxCount policy
-
-        ImageInfo info = getImageInfo(parentInfo, childItem)
+        if (currentPath.name == "manifest.json") {
+            manifestInfo = childItem
+        }
+        if (currentPath.name.startsWith("sha256__")) {
+            layerPaths.put(currentPath.name, currentPath)
+        }
+    }
+    while (manifestInfo != null) {
+        log.debug("Scanning File: $manifestInfo.repoPath")
+        ImageInfo info = getImageInfo(parentInfo, manifestInfo)
         if (info == null) {
             log.error("Invalid image labels: $parentRepoPath")
-            continue
+            break
         }
         if (info.expireDate > 0) {
             if (info.expireDate >= now) {
                 log.warn("Removing image: $parentRepoPath - by expireDate")
                 removeSet << parentRepoPath
-                continue
+                break
             }
             log.debug("Keep image: $parentRepoPath - expireDate is in future")
-            continue
+            break
         }
 
-        if ((info.pullProtectDays != null) && (info.pullDate > 0)) {
+        def manifest
+        try (InputStream stream = repositories.getContent(manifestInfo.repoPath).inputStream) {
+            manifest = new JsonSlurper().parse(stream)
+        }
+        long lastPullTime = 0
+        for (layer in manifest.layers) {
+            String digest = layer.digest
+            RepoPath layerPath = layerPaths.get(digest.replaceAll(":", "__"))
+            if (layerPath) {
+                StatsInfo statsInfo = repositories.getStats(layerPath)
+                if ((statsInfo != null) && (lastPullTime < statsInfo.lastDownloaded)) {
+                    lastPullTime = statsInfo.lastDownloaded
+                }
+            }
+        }
+
+        if ((info.pullProtectDays != null) && (lastPullTime > 0)) {
             if (info.pullProtectDays < 0) {
                 log.debug("Keep image: $parentRepoPath - pulled and protected by infinity time")
-                continue
+                break
             }
-            if (info.pullDate + info.pullProtectDays * oneDay > now) {
+            if (lastPullTime + info.pullProtectDays * oneDay > now) {
                 log.debug("Keep image: $parentRepoPath - pulled recently")
-                continue
+                break
             }
         }
 
@@ -137,12 +157,12 @@ List<String> registryTraverse(ItemInfo parentInfo, int defaultMaxDays, boolean d
         if (info.maxDays != null) {
             if (info.maxDays < 0) {
                 log.debug("Keep image: $parentRepoPath - keep forever")
-                continue
+                break
             }
             if (info.createdTime + info.maxDays * oneDay <= now) {
                 log.warn("Removing image: $parentRepoPath - created too long")
                 removeSet << parentRepoPath
-                continue
+                break
             }
             isDefault = false
         }
@@ -152,9 +172,10 @@ List<String> registryTraverse(ItemInfo parentInfo, int defaultMaxDays, boolean d
                 parentGroups.put(info.maxCountGroup, new ArrayList<>())
             }
             parentGroups[info.maxCountGroup] << info
-            continue
+            break
         }
         log.debug("Keep image: $parentRepoPath - created recently")
+        break
     }
 
     // Process registry and subregistry
@@ -188,7 +209,6 @@ List<String> registryTraverse(ItemInfo parentInfo, int defaultMaxDays, boolean d
 
 ImageInfo getImageInfo(ItemInfo repo, ItemInfo item) {
     try {
-        StatsInfo statsInfo = repositories.getStats(item.repoPath)
         String expireDateProp = repositories.getProperty(item.repoPath, "com.joom.retention.expireDate")
         if (expireDateProp == null) {
             expireDateProp = repositories.getProperty(repo.repoPath, "com.joom.retention.expireDate")
@@ -211,7 +231,6 @@ ImageInfo getImageInfo(ItemInfo repo, ItemInfo item) {
 
                 // Image info
                 createdTime: item.lastModified,
-                pullDate: statsInfo ? statsInfo.lastDownloaded : 0L,
         )
     } catch (IllegalArgumentException e) {
         log.error(e.printStackTrace())
