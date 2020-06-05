@@ -122,10 +122,7 @@ List<String> registryTraverse(ItemInfo parentInfo, int defaultMaxDays, boolean d
             break
         }
 
-        def manifest
-        try (InputStream stream = repositories.getContent(manifestInfo.repoPath).inputStream) {
-            manifest = new JsonSlurper().parse(stream)
-        }
+        def manifest = new JsonSlurper().parse(repositories.getContent(manifestInfo.repoPath).inputStream)
         long lastPullTime = 0
         for (layer in manifest.layers) {
             String digest = layer.digest
