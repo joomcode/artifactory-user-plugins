@@ -195,7 +195,7 @@ List<String> registryTraverse(ItemInfo parentInfo, int defaultMaxDays, boolean d
             }
 
             boolean maxDaysExpired = (maxDays != null) && (info.getCreatedTime() + maxDays * oneDay <= now)
-            if ((!maxDaysExpired) && (maxDays == null)) {
+            if ((!maxDaysExpired) && (maxCount == null)) {
                 log.debug("Keep image: $parentRepoPath - created recently without count limit")
                 break
             }
