@@ -177,7 +177,7 @@ class CleanDockerImagesTest extends Specification {
 
     void mkImage(repo, path, content, ct, String group = null) {
         def countProp = 'docker.label.com.joom.retention.maxCount'
-        def groupProp = 'docker.label.com.joom.retention.group'
+        def groupProp = 'docker.label.com.joom.retention.deployGroup'
         def stream = new ByteArrayInputStream(content.getBytes('utf-8'))
         repo.upload(path, stream).doUpload()
         repo.file(path).properties().addProperty(countProp, "$ct").doSet()

@@ -41,22 +41,22 @@ class ImageGroups {
     def log
     boolean dryRun
 
-    boolean isProtected(String group) {
-        if (group == null) {
-            return false
+    RepoPath getProtectedBy(String deployGroup) {
+        if (deployGroup == null) {
+            return null
         }
-        GroupInfo info = groups.get(group)
+        GroupInfo info = groups.get(deployGroup)
         if (info == null) {
-            return false
+            return null
         }
         return info.keep
     }
 
-    void protectGroup(String group, RepoPath path) {
-        GroupInfo info = groups.get(group)
+    void protectGroup(String deployGroup, RepoPath path) {
+        GroupInfo info = groups.get(deployGroup)
         if (info == null) {
             info = new GroupInfo()
-            groups.put(group, info)
+            groups.put(deployGroup, info)
         }
         if (info.keep == null) {
             info.keep = path
@@ -65,15 +65,15 @@ class ImageGroups {
     }
 
     void removeImage(ImageInfo image) {
-        String group = image.getGroup(repositories)
-        if (group == null) {
+        String deployGroup = image.getDeployGroup(repositories)
+        if (deployGroup == null) {
             deleteImage(image.repo.repoPath)
             return
         }
-        GroupInfo info = groups.get(group)
+        GroupInfo info = groups.get(deployGroup)
         if (info == null) {
             info = new GroupInfo()
-            groups.put(group, info)
+            groups.put(deployGroup, info)
         }
         if (info.keep != null) {
             log.debug("Keep image: ${image.repo.repoPath} - image in same group (${info.keep}) is protected")
@@ -142,8 +142,9 @@ class ImageInfo {
         return maxDaysProp ? maxDaysProp.toInteger() : null
     }
 
-    String getGroup(Repositories repositories) {
-        return repositories.getProperty(manifest.repoPath, "docker.label.com.joom.retention.group")
+    String getDeployGroup(Repositories repositories) {
+        def deployGroupProp = repositories.getProperty(manifest.repoPath, "docker.label.com.joom.retention.deployGroup")
+        return deployGroupProp ? deployGroupProp : null
     }
 
     boolean isPullProtected(Repositories repositories) {
@@ -171,7 +172,7 @@ class ImageInfo {
                 if ((statsInfo == null) || (statsInfo.lastDownloaded <= 0)) {
                     continue
                 }
-                if ((statsInfo.lastDownloaded > pullDeadline) || (info.pullProtectDays < 0)) {
+                if ((statsInfo.lastDownloaded > pullDeadline) || (getPullProtectDays(repositories) < 0)) {
                     return true
                 }
             }
@@ -192,7 +193,7 @@ executions {
         def defaultMaxDays = parsed.defaultMaxDays
         def dryRun = params['dryRun'] ? params['dryRun'][0] as boolean : false
         repos.each {
-            log.error("Cleaning Docker images in repo: $it")
+            log.debug("Cleaning Docker images in repo: $it")
             def del = buildParentRepoPaths(RepoPathFactory.create(it), defaultMaxDays, dryRun)
             deleted.addAll(del)
         }
@@ -256,7 +257,7 @@ def registryTraverse(ItemInfo parentInfo, ImageGroups groups, int defaultMaxDays
 
     try {
         while (manifestInfo != null) {
-            log.error("Scanning File: $manifestInfo.repoPath")
+            log.debug("Scanning File: $manifestInfo.repoPath")
             ImageInfo info = getImageInfo(parentInfo, manifestInfo)
             if (info == null) {
                 log.error("Invalid image labels: $parentRepoPath")
@@ -264,18 +265,7 @@ def registryTraverse(ItemInfo parentInfo, ImageGroups groups, int defaultMaxDays
             }
             info.layerPaths = layerPaths
 
-            String group = info.getGroup(repositories)
-            if (groups.isProtected(group)) {
-                log.error("Keep image: $parentRepoPath - image in same group is protected")
-
-                String maxCountGroup = info.getMaxCountGroup(repositories)
-                if (!parentGroups.containsKey(maxCountGroup)) {
-                    parentGroups.put(maxCountGroup, new ArrayList<>())
-                }
-                parentGroups[maxCountGroup] << info
-                break
-            }
-
+            String deployGroup = info.getDeployGroup(repositories)
             long expireDate = info.getExpireDate(repositories)
             if (expireDate > 0) {
                 if (expireDate >= now) {
@@ -283,8 +273,8 @@ def registryTraverse(ItemInfo parentInfo, ImageGroups groups, int defaultMaxDays
                     removeSet << parentRepoPath
                     break
                 }
-                log.error("Keep image: $parentRepoPath - expireDate is in future")
-                groups.protectGroup(group, info.repo.repoPath)
+                log.debug("Keep image: $parentRepoPath - expireDate is in future")
+                groups.protectGroup(deployGroup, info.repo.repoPath)
                 break
             }
 
@@ -296,18 +286,13 @@ def registryTraverse(ItemInfo parentInfo, ImageGroups groups, int defaultMaxDays
 
             boolean maxDaysExpired = (maxDays != null) && (info.getCreatedTime() + maxDays * oneDay <= now)
             if ((!maxDaysExpired) && (maxCount == null)) {
-                log.error("Keep image: $parentRepoPath - created recently without count limit")
-                groups.protectGroup(group, info.repo.repoPath)
+                log.debug("Keep image: $parentRepoPath - created recently without count limit")
+                groups.protectGroup(deployGroup, info.repo.repoPath)
                 break
             }
 
             if (maxDaysExpired) {
-                if (info.isPullProtected(repositories)) {
-                    log.error("Keep image: $parentRepoPath - created too long, but pulled recently")
-                    groups.protectGroup(group, info.repo.repoPath)
-                    break
-                }
-                log.error("Obsolete image: $parentRepoPath - created too long")
+                log.debug("Obsolete image: $parentRepoPath - created too long")
                 removeSet << info
                 break
             }
@@ -320,29 +305,40 @@ def registryTraverse(ItemInfo parentInfo, ImageGroups groups, int defaultMaxDays
                 parentGroups[maxCountGroup] << info
                 break
             }
-            log.error("Keep image: $parentRepoPath - created recently")
-            groups.protectGroup(group, item)
+            log.debug("Keep image: $parentRepoPath - created recently")
+            groups.protectGroup(deployGroup, item)
             break
         }
 
-        for (List<ImageInfo> group in childGroups.values()) {
-            group = group.sort { -it.getCreatedTime() }
+        for (List<ImageInfo> imageGroup in childGroups.values()) {
+            imageGroup = imageGroup.sort { -it.getCreatedTime() }
 
             int keeped = 0
-            for (ImageInfo item in group) {
+            for (ImageInfo item in imageGroup) {
                 if (keeped < item.getMaxCount(repositories)) {
-                    log.error("Keep image: ${item.repo.repoPath} - max count not reached")
-                    groups.protectGroup(item.getGroup(repositories), item.repo.repoPath)
+                    log.debug("Keep image: ${item.repo.repoPath} - max count not reached")
+                    groups.protectGroup(item.getDeployGroup(repositories), item.repo.repoPath)
                     keeped++
                     continue
                 }
-                log.error("Obsolete image: ${item.repo.repoPath} - too many images")
+                log.debug("Obsolete image: ${item.repo.repoPath} - too many images")
                 removeSet << item
             }
         }
 
         // Remove images from repository
         for (ImageInfo item in removeSet) {
+            def deployGroup = item.getDeployGroup(repositories)
+            def protectedBy = groups.getProtectedBy(deployGroup)
+            if (protectedBy) {
+                log.debug("Keep image: $parentRepoPath - obsolete, but protected by $protectedBy")
+                continue
+            }
+            if (item.isPullProtected(repositories)) {
+                log.debug("Keep image: $parentRepoPath - obsolete, but pulled recently")
+                groups.protectGroup(deployGroup, item.repo.repoPath)
+                continue
+            }
             groups.removeImage(item)
         }
     } catch (IllegalArgumentException e) {
@@ -350,7 +346,7 @@ def registryTraverse(ItemInfo parentInfo, ImageGroups groups, int defaultMaxDays
     }
 }
 
-ImageInfo getImageInfo(ItemInfo repo, ItemInfo item) {
+static ImageInfo getImageInfo(ItemInfo repo, ItemInfo item) {
     return new ImageInfo(
             manifest: item,
             repo: repo,
