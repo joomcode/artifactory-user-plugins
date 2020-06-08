@@ -20,6 +20,7 @@ import groovy.json.JsonBuilder
 import groovy.json.JsonSlurper
 import org.artifactory.fs.ItemInfo
 import org.artifactory.fs.StatsInfo
+import org.artifactory.md.Properties
 import org.artifactory.repo.RepoPath
 import org.artifactory.repo.RepoPathFactory
 import org.artifactory.repo.Repositories
@@ -64,8 +65,8 @@ class ImageGroups {
         }
     }
 
-    void removeImage(ImageInfo image) {
-        String deployGroup = image.getDeployGroup(repositories)
+    void obsoleteImage(ImageInfo image) {
+        String deployGroup = image.getDeployGroup()
         if (deployGroup == null) {
             deleteImage(image.repo.repoPath)
             return
@@ -96,7 +97,7 @@ class ImageGroups {
         }
     }
 
-    private void deleteImage(RepoPath path) {
+    void deleteImage(RepoPath path) {
         log.warn("Removing image: ${path}")
         deleted << path.id
         if (!dryRun) {
@@ -106,49 +107,68 @@ class ImageGroups {
 }
 
 class ImageInfo {
+    Repositories repositories
     ItemInfo manifest
     ItemInfo repo
     Map<String, RepoPath> layerPaths
+
+    // Lazy
+    Properties _manifestProps
+    Properties _repoProps
 
     long getCreatedTime() {
         return manifest.lastModified
     }
 
-    long getExpireDate(Repositories repositories) {
-        String expireDateProp = repositories.getProperty(manifest.repoPath, "com.joom.retention.expireDate")
+    Properties getManifestProps() {
+        if (_manifestProps == null) {
+            _manifestProps = repositories.getProperties(manifest.repoPath)
+        }
+        return _manifestProps
+    }
+
+    Properties getRepoProps() {
+        if (_repoProps == null) {
+            _repoProps = repositories.getProperties(repo.repoPath)
+        }
+        return _repoProps
+    }
+
+    long getExpireDate() {
+        String expireDateProp = getManifestProps().getFirst("com.joom.retention.expireDate")
         if (expireDateProp == null) {
-            expireDateProp = repositories.getProperty(repo.repoPath, "com.joom.retention.expireDate")
+            expireDateProp = getRepoProps().getFirst("com.joom.retention.expireDate")
         }
         return expireDateProp ? DateTime.parse(expireDateProp).millis : 0L
     }
 
-    Integer getPullProtectDays(Repositories repositories) {
-        String pullProtectDaysProp = repositories.getProperty(manifest.repoPath, "docker.label.com.joom.retention.pullProtectDays")
+    Integer getPullProtectDays() {
+        String pullProtectDaysProp = getManifestProps().getFirst("docker.label.com.joom.retention.pullProtectDays")
         return pullProtectDaysProp ? pullProtectDaysProp.toInteger() : null
     }
 
-    Integer getMaxCount(Repositories repositories) {
-        String maxCountProp = repositories.getProperty(manifest.repoPath, "docker.label.com.joom.retention.maxCount")
+    Integer getMaxCount() {
+        String maxCountProp = getManifestProps().getFirst("docker.label.com.joom.retention.maxCount")
         return maxCountProp ? maxCountProp.toInteger() : null
     }
 
-    String getMaxCountGroup(Repositories repositories) {
-        String maxCountGroupProp = repositories.getProperty(manifest.repoPath, "docker.label.com.joom.retention.maxCountGroup")
+    String getMaxCountGroup() {
+        String maxCountGroupProp = getManifestProps().getFirst("docker.label.com.joom.retention.maxCountGroup")
         return maxCountGroupProp ? maxCountGroupProp : ""
     }
 
-    Integer getMaxDays(Repositories repositories) {
-        String maxDaysProp = repositories.getProperty(manifest.repoPath, "docker.label.com.joom.retention.maxDays")
+    Integer getMaxDays() {
+        String maxDaysProp = getManifestProps().getFirst("docker.label.com.joom.retention.maxDays")
         return maxDaysProp ? maxDaysProp.toInteger() : null
     }
 
-    String getDeployGroup(Repositories repositories) {
-        def deployGroupProp = repositories.getProperty(manifest.repoPath, "docker.label.com.joom.retention.deployGroup")
+    String getDeployGroup() {
+        def deployGroupProp = getManifestProps().getFirst("docker.label.com.joom.retention.deployGroup")
         return deployGroupProp ? deployGroupProp : null
     }
 
-    boolean isPullProtected(Repositories repositories) {
-        def pullProtectDays = getPullProtectDays(repositories)
+    boolean isPullProtected() {
+        def pullProtectDays = getPullProtectDays()
         if (pullProtectDays == null) {
             return false
         }
@@ -172,7 +192,7 @@ class ImageInfo {
                 if ((statsInfo == null) || (statsInfo.lastDownloaded <= 0)) {
                     continue
                 }
-                if ((statsInfo.lastDownloaded > pullDeadline) || (getPullProtectDays(repositories) < 0)) {
+                if ((statsInfo.lastDownloaded > pullDeadline) || (getPullProtectDays() < 0)) {
                     return true
                 }
             }
@@ -265,12 +285,12 @@ def registryTraverse(ItemInfo parentInfo, ImageGroups groups, int defaultMaxDays
             }
             info.layerPaths = layerPaths
 
-            String deployGroup = info.getDeployGroup(repositories)
-            long expireDate = info.getExpireDate(repositories)
+            String deployGroup = info.getDeployGroup()
+            long expireDate = info.getExpireDate()
             if (expireDate > 0) {
                 if (expireDate >= now) {
                     log.warn("Removing image: $parentRepoPath - by expireDate")
-                    removeSet << parentRepoPath
+                    groups.deleteImage(info.repo.repoPath)
                     break
                 }
                 log.debug("Keep image: $parentRepoPath - expireDate is in future")
@@ -278,8 +298,8 @@ def registryTraverse(ItemInfo parentInfo, ImageGroups groups, int defaultMaxDays
                 break
             }
 
-            def maxCount = info.getMaxCount(repositories)
-            def maxDays = info.getMaxDays(repositories)
+            def maxCount = info.getMaxCount()
+            def maxDays = info.getMaxDays()
             if ((maxCount == null) && (maxDays == null)) {
                 maxDays = defaultMaxDays
             }
@@ -298,7 +318,7 @@ def registryTraverse(ItemInfo parentInfo, ImageGroups groups, int defaultMaxDays
             }
 
             if (maxCount != null) {
-                String maxCountGroup = info.getMaxCountGroup(repositories)
+                String maxCountGroup = info.getMaxCountGroup()
                 if (!parentGroups.containsKey(maxCountGroup)) {
                     parentGroups.put(maxCountGroup, new ArrayList<>())
                 }
@@ -315,9 +335,9 @@ def registryTraverse(ItemInfo parentInfo, ImageGroups groups, int defaultMaxDays
 
             int keeped = 0
             for (ImageInfo item in imageGroup) {
-                if (keeped < item.getMaxCount(repositories)) {
+                if (keeped < item.getMaxCount()) {
                     log.debug("Keep image: ${item.repo.repoPath} - max count not reached")
-                    groups.protectGroup(item.getDeployGroup(repositories), item.repo.repoPath)
+                    groups.protectGroup(item.getDeployGroup(), item.repo.repoPath)
                     keeped++
                     continue
                 }
@@ -328,26 +348,27 @@ def registryTraverse(ItemInfo parentInfo, ImageGroups groups, int defaultMaxDays
 
         // Remove images from repository
         for (ImageInfo item in removeSet) {
-            def deployGroup = item.getDeployGroup(repositories)
+            def deployGroup = item.getDeployGroup()
             def protectedBy = groups.getProtectedBy(deployGroup)
             if (protectedBy) {
                 log.debug("Keep image: $parentRepoPath - obsolete, but protected by $protectedBy")
                 continue
             }
-            if (item.isPullProtected(repositories)) {
+            if (item.isPullProtected()) {
                 log.debug("Keep image: $parentRepoPath - obsolete, but pulled recently")
                 groups.protectGroup(deployGroup, item.repo.repoPath)
                 continue
             }
-            groups.removeImage(item)
+            groups.obsoleteImage(item)
         }
     } catch (IllegalArgumentException e) {
         log.error(e.printStackTrace())
     }
 }
 
-static ImageInfo getImageInfo(ItemInfo repo, ItemInfo item) {
+ImageInfo getImageInfo(ItemInfo repo, ItemInfo item) {
     return new ImageInfo(
+            repositories: repositories,
             manifest: item,
             repo: repo,
     )
