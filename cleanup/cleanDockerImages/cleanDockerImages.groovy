@@ -27,6 +27,7 @@ import org.artifactory.repo.Repositories
 import org.joda.time.DateTime
 
 import java.util.concurrent.TimeUnit
+import java.util.regex.Pattern
 
 Repositories repositories
 
@@ -212,15 +213,35 @@ executions {
         def repos = parsed.dockerRepos
         def defaultMaxDays = parsed.defaultMaxDays
         def dryRun = params['dryRun'] ? Boolean.parseBoolean(params['dryRun'][0]) : false
-        repos.each {
-            log.debug("Cleaning Docker images in repo: $it")
-            def del = buildParentRepoPaths(RepoPathFactory.create(it), defaultMaxDays, dryRun)
+
+        for (repository in getMatchedRepositories(repos)) {
+            log.debug("Cleaning Docker images in repo: $repository")
+            def del = buildParentRepoPaths(RepoPathFactory.create(repository), defaultMaxDays, dryRun)
             deleted.addAll(del)
         }
         def json = [status: 'okay', dryRun: dryRun, deleted: deleted]
         message = new JsonBuilder(json).toPrettyString()
         status = 200
     }
+}
+
+List<String> getMatchedRepositories(Collection<String> patterns) {
+    List<String> found = new ArrayList<>()
+    repositories.getLocalRepositories().each {
+        if (isMatched(it, patterns) && repositories.getRepositoryConfiguration(it).isEnableDockerSupport()) {
+            found.add(it)
+        }
+    }
+    return found
+}
+
+static boolean isMatched(String name, Collection<String> patterns) {
+    for (pattern in patterns) {
+        if (Pattern.matches(pattern, name)) {
+            return true
+        }
+    }
+    return false
 }
 
 def buildParentRepoPaths(path, int defaultMaxDays, boolean dryRun) {
