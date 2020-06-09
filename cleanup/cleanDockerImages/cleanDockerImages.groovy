@@ -211,7 +211,7 @@ executions {
         def parsed = new ConfigSlurper().parse(propsfile.toURL())
         def repos = parsed.dockerRepos
         def defaultMaxDays = parsed.defaultMaxDays
-        def dryRun = params['dryRun'] ? params['dryRun'][0] as boolean : false
+        def dryRun = params['dryRun'] ? Boolean.parseBoolean(params['dryRun'][0]) : false
         repos.each {
             log.debug("Cleaning Docker images in repo: $it")
             def del = buildParentRepoPaths(RepoPathFactory.create(it), defaultMaxDays, dryRun)
