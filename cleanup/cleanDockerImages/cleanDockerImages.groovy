@@ -212,7 +212,7 @@ executions {
         def parsed = new ConfigSlurper().parse(propsfile.toURL())
         def repos = parsed.dockerRepos
         def defaultMaxDays = parsed.defaultMaxDays
-        def dryRun = params['dryRun'] ? Boolean.parseBoolean(params['dryRun'][0]) : false
+        def dryRun = params['dryRun'] ? parseBoolean(params['dryRun'][0]) : false
 
         for (repository in getMatchedRepositories(repos)) {
             log.debug("Cleaning Docker images in repo: $repository")
@@ -393,4 +393,32 @@ ImageInfo getImageInfo(ItemInfo repo, ItemInfo item) {
             manifest: item,
             repo: repo,
     )
+}
+
+static boolean parseBoolean(String value, boolean defaultValue = false) {
+    if (value == null) {
+        return defaultValue
+    }
+    switch (value.toLowerCase()) {
+        case "":
+            return defaultValue
+        case "true":
+            return true
+        case "yes":
+            return true
+        case "on":
+            return true
+        case "1":
+            return true
+        case "false":
+            return false
+        case "no":
+            return false
+        case "off":
+            return false
+        case "0":
+            return false
+        default:
+            throw new IllegalArgumentException(value)
+    }
 }
