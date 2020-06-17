@@ -325,9 +325,13 @@ def registryTraverse(ItemInfo parentInfo, ImageGroups groups, int defaultMaxDays
                 maxDays = defaultMaxDays
             }
 
-            boolean maxDaysExpired = (maxDays != null) && (info.getCreatedTime() + maxDays * oneDay <= now)
+            boolean maxDaysExpired = (maxDays != null) && (info.getCreatedTime() + maxDays * oneDay <= now) && (maxDays >= 0)
             if ((!maxDaysExpired) && (maxCount == null)) {
-                log.debug("Keep image: $parentRepoPath - created recently without count limit")
+                if (maxDays >= 0) {
+                    log.debug("Keep image: $parentRepoPath - created recently without count limit")
+                } else {
+                    log.debug("Keep image: $parentRepoPath - marked as keep forever without count limit")
+                }
                 groups.protectGroup(deployGroup, info.repo.repoPath)
                 break
             }
